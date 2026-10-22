@@ -7,6 +7,8 @@
 
 namespace Slic3r {
 
+class PresetCollection;
+
 class SnapmakerPrinterAgent final : public MoonrakerPrinterAgent
 {
 public:
@@ -17,6 +19,15 @@ public:
     AgentInfo        get_agent_info() override { return get_agent_info_static(); }
 
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override;
+
+    // Return the filament_id of the vendor's preset that best fits a slot, or empty when the
+    // vendor has none for the type. Presets keep the base type ("PLA") and carry the subtype in
+    // their name ("Bambu PLA Matte"), so the name is matched against the subtype as well.
+    static std::string match_filament_preset(const PresetCollection& filaments,
+                                             const std::string&      vendor,
+                                             const std::string&      type,
+                                             const std::string&      sub_type,
+                                             const std::string&      color_rgba);
 
 private:
     // Combine filament_type + filament_sub_type into a unified type string
