@@ -6,11 +6,16 @@
 #include "slic3r/GUI/GUI_App.hpp"
 
 #include "nlohmann/json.hpp"
+#include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/log/trivial.hpp>
 #include <vector>
 #include <string>
 #include "libslic3r/Preset.hpp"
+#include <cctype>
 #include <cstddef>
+#include <limits>
+#include <tuple>
 #include <utility>
 
 namespace Slic3r {
@@ -26,51 +31,83 @@ T safe_at(const std::vector<T>& vec, int index, const T& fallback)
     return (index >= 0 && index < static_cast<int>(vec.size())) ? vec[index] : fallback;
 }
 
-std::string find_closest_color_preset_by_vendor_and_type(const PresetCollection& filaments,
-                                                         const std::string&      vendor_name,
-                                                         const std::string&      filament_type,
+unsigned int color_distance(const std::string& color_rgba, const Preset& p)
+{
+    // The printer returns RGBA in the format RRGGBBAA, but profiles store color as #RRGGBB,
+    // so we must remove # and ignore alpha channel for distance calculation
+    unsigned int target_color_value = std::stoul(color_rgba.substr(0, color_rgba.length() - 2), nullptr, 16);
+
+    std::string  p_color = p.config.opt_string("default_filament_colour", 0u);
+    unsigned int p_color_value;
+    if (!p_color.empty()) {
+        size_t       hash_pos = p_color.find("#");
+        p_color_value         = std::stoul(p_color.substr(hash_pos != std::string::npos ? hash_pos + 1 : 0), nullptr, 16);
+    } else {
+        // Default to black if no color specified in profile. Assume other profiles might be a closer color match.
+        // Could be a problem if the target color is also black and there exist a specific profile for that type, vendor and color
+        // combination.
+        p_color_value = 0;
+    }
+
+    // Calculate Euclidean color distance in RGB space
+    int dr = ((target_color_value & 0xff) - (p_color_value & 0xff));
+    int dg = (((target_color_value >> 8) & 0xff) - ((p_color_value >> 8) & 0xff));
+    int db = (((target_color_value >> 16) & 0xff) - ((p_color_value >> 16) & 0xff));
+    return dr * dr + dg * dg + db * db;
+}
+
+// Whether upper-case `word` appears in `name` as a whole word, so "META" does not match "Metal".
+bool names_word(const std::string& name, const std::string& word)
+{
+    const std::string upper   = boost::algorithm::to_upper_copy(name);
+    const auto        is_word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0; };
+    for (size_t pos = upper.find(word); pos != std::string::npos; pos = upper.find(word, pos + 1)) {
+        const size_t end = pos + word.size();
+        if ((pos == 0 || !is_word(word.front()) || !is_word(upper[pos - 1])) &&
+            (end == upper.size() || !is_word(word.back()) || !is_word(upper[end])))
+            return true;
+    }
+    return false;
+}
+
+} // anonymous namespace
+
+std::string SnapmakerPrinterAgent::match_filament_preset(const PresetCollection& filaments,
+                                                         const std::string&      vendor,
+                                                         const std::string&      type,
+                                                         const std::string&      sub_type,
                                                          const std::string&      color_rgba)
 {
-    std::string best_match_id       = "";
-    int         best_color_distance = 0xffffffff;
+    const std::string base_type     = combine_filament_type(type, "");
+    const std::string combined_type = combine_filament_type(type, sub_type);
+    const std::string sub           = trim_and_upper(sub_type);
+    const bool        has_sub       = !sub.empty() && sub != "NONE";
+
+    // Ranked by: declares the combined type, names the subtype, then closest color.
+    std::tuple<bool, bool, unsigned int> best_rank{true, true, std::numeric_limits<unsigned int>::max()};
+    std::string                          best_match_id;
 
     for (const auto& p : filaments.get_presets()) {
-        if (p.is_visible && p.is_compatible &&
-            // Filament profile must be detached from parent to be considered for matching
-            filaments.get_preset_base(p) == &p && p.config.opt_string("filament_vendor", 0u) == vendor_name &&
-            p.config.opt_string("filament_type", 0u) == filament_type) {
-            // The printer returns RGBA in the format RRGGBBAA, but profiles store color as #RRGGBB,
-            // so we must remove # and ignore alpha channel for distance calculation
-            unsigned int target_color_value = std::stoul(color_rgba.substr(0, color_rgba.length() - 2), nullptr, 16);
+        // Filament profile must be detached from parent to be considered for matching
+        if (!p.is_visible || !p.is_compatible || filaments.get_preset_base(p) != &p ||
+            !boost::algorithm::iequals(p.config.opt_string("filament_vendor", 0u), vendor))
+            continue;
 
-            std::string  p_color = p.config.opt_string("default_filament_colour", 0u);
-            unsigned int p_color_value;
-            if (!p_color.empty()) {
-                size_t       hash_pos = p_color.find("#");
-                p_color_value         = std::stoul(p_color.substr(hash_pos != std::string::npos ? hash_pos + 1 : 0), nullptr, 16);
-            } else {
-                // Default to black if no color specified in profile. Assume other profiles might be a closer color match.
-                // Could be a problem if the target color is also black and there exist a specific profile for that type, vendor and color
-                // combination.
-                p_color_value = 0;
-            }
+        const std::string preset_type   = p.config.opt_string("filament_type", 0u);
+        const bool        declares_type = boost::algorithm::iequals(preset_type, combined_type);
+        if (!declares_type && !boost::algorithm::iequals(preset_type, base_type))
+            continue;
 
-            // Calculate Euclidean color distance in RGB space
-            int dr = ((target_color_value & 0xff) - (p_color_value & 0xff));
-            int dg = (((target_color_value >> 8) & 0xff) - ((p_color_value >> 8) & 0xff));
-            int db = (((target_color_value >> 16) & 0xff) - ((p_color_value >> 16) & 0xff));
-            unsigned int distance = dr * dr + dg * dg + db * db;
-
-            if (distance < best_color_distance) {
-                best_color_distance = distance;
-                best_match_id       = p.filament_id;
-            }
+        const std::tuple<bool, bool, unsigned int> rank{!declares_type,
+                                                        !(has_sub && names_word(p.name, sub)),
+                                                        color_distance(color_rgba, p)};
+        if (best_match_id.empty() || rank < best_rank) {
+            best_rank     = rank;
+            best_match_id = p.filament_id;
         }
     }
     return best_match_id;
 }
-
-} // anonymous namespace
 
 SnapmakerPrinterAgent::SnapmakerPrinterAgent(std::string log_dir) : MoonrakerPrinterAgent(std::move(log_dir)) {}
 
@@ -94,6 +131,8 @@ std::string SnapmakerPrinterAgent::combine_filament_type(const std::string& type
         return base + "-CF";
     if (sub == "GF")
         return base + "-GF";
+    if (sub == "HF")
+        return base + " HF";
     if (sub == "SNAPSPEED" || sub == "HS")
         return base + " HIGH SPEED";
     if (sub == "SILK")
@@ -200,8 +239,8 @@ bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSync
             // If not found, default to traditional search by type only or generic type mapping.
             if (bundle) {
                 std::string vendor      = safe_at(filament_vendor, i, empty_str);
-                std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendor, tray.tray_type,
-                                                                                       tray.tray_color);
+                std::string filament_id = match_filament_preset(bundle->filaments, vendor, safe_at(filament_type, i, empty_str),
+                                                                safe_at(filament_sub_type, i, empty_str), tray.tray_color);
 
                 if (!filament_id.empty()) {
                     tray.tray_info_idx = filament_id;
